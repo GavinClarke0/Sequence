@@ -1,30 +1,30 @@
-
-use std::{io::Write, marker::PhantomData};
-use anyhow::{Result, Context, bail};
 use async_trait::async_trait;
-use crc_fast::{Digest, CrcAlgorithm::Crc32IsoHdlc};
-use crate::log_value::{LogValue, ArchivedLogValueView};
+use parking_lot::{RwLock};
+use std::{mem, cell::UnsafeCell};
+use crate::log_value::{LogValueDeserialized, Data};
+
 
 /// High-level async trait for writing log entries to an active segment
 #[async_trait]
-pub trait LogSegmentWriter: Send {
+pub trait LogSegmentWriter<D: Data>: Send + Sync {
     /// Append a log value and return its assigned index
-    async fn append(&mut self, log_value: LogValue) -> Result<u32, LogSegmentError>;
-
+    async fn append(&self, log_value: LogValueDeserialized<D>) -> Result<u32, LogSegmentError>;
     /// Seal the segment, making it immutable and ready for reads
     async fn seal(self) -> Result<(), LogSegmentError>;
-
+    /// Min log index in the segment
     fn min_index(&self) -> u32;
+    /// Max log segment in the log segment.
     fn max_index(&self) -> u32;
 }
 
 /// High-level async trait for reading log entries from a sealed segment
 #[async_trait]
-pub trait LogSegmentReader: Send + Sync {
-    /// Get a log value by its index (zero-copy from in-memory buffer)
-    async fn get(&self, index: u32) -> Result<LogEntryView<'_>, LogSegmentError>;
-
+pub trait LogSegmentReader<D: Data>: Send + Sync {
+    /// Get a log value by its index (returns serialized bytes)
+    async fn get(&self, index: u32) -> Result<LogValueDeserialized<D>, LogSegmentError>;
+    /// Min index in the log segment
     fn min_index(&self) -> u32;
+    /// Maximum index in the log segment.
     fn max_index(&self) -> u32;
 }
 
@@ -44,380 +44,261 @@ pub enum LogSegmentError {
 
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
-}
-
-/// Sealed (read-only) log segment
-/// Data is loaded into memory on open, reads are zero-copy from memory buffer
-pub struct SealedLogSegment<D: LogSegmentDataStore, I: LogSegmentIndexStore> {
-    data_store: D,
-    index_store: I,
-    min_index: u32,
-    max_index: u32,
-}
-
-impl<D: LogSegmentDataStore, I: LogSegmentIndexStore> SealedLogSegment<D, I> {
-    pub fn new(data_store: D, index_store: I) -> Self {
-        let min_index = index_store.min_index();
-        let max_index = index_store.max_index();
-        Self {
-            data_store,
-            index_store,
-            min_index,
-            max_index,
-        }
-    }
-}
-
-pub struct ActiveLogSegment<D: LogSegmentDataStore, I: LogSegmentIndexStore> {
-    data_store: D,
-    index_store: I,
-    next_index: u32,
-    min_index: u32,
-}
-
-impl<D: LogSegmentDataStore, I: LogSegmentIndexStore> ActiveLogSegment<D, I> {
-    pub fn new(data_store: D, index_store: I, min_index: u32) -> Self {
-        Self {
-            data_store,
-            index_store,
-            next_index: min_index,
-            min_index,
-        }
-    }
-}
-
-#[async_trait]
-impl<D: LogSegmentDataStore, I: LogSegmentIndexStore> LogSegmentWriter for ActiveLogSegment<D, I> {
-    async fn append(&mut self, log_value: LogValue) -> Result<u32, LogSegmentError> {
-        // Build log entry with CRC validation
-        let entry = LogEntry::from_log_value(&log_value)
-            .map_err(|e| LogSegmentError::WriteError(format!("{}", e)))?;
-        let entry_bytes = entry.build();
-
-        // Write to data store (O_DIRECT)
-        let (offset, _) = self.data_store.append(&entry_bytes).await?;
-
-        // Persist index mapping before making visible
-        let index = self.next_index;
-        self.index_store.write_offset(index, offset).await?;
-        self.index_store.flush().await?;
-
-        // TODO commit to internal pre-parsed data structure. 
-
-        self.next_index += 1;
-        Ok(index)
-    }
-
-    async fn seal(mut self) -> Result<(), LogSegmentError> {
-        self.data_store.flush().await?;
-        self.index_store.flush().await?;
-        Ok(())
-    }
-
-    fn min_index(&self) -> u32 {
-        self.min_index
-    }
-
-    fn max_index(&self) -> u32 {
-        self.next_index.saturating_sub(1)
-    }
-}
-
-#[async_trait]
-impl<D: LogSegmentDataStore, I: LogSegmentIndexStore> LogSegmentReader for SealedLogSegment<D, I> {
-    async fn get(&self, index: u32) -> Result<LogEntryView<'_>, LogSegmentError> {
-        if index < self.min_index || index > self.max_index {
-            return Err(LogSegmentError::IndexOutOfBounds {
-                index,
-                min: self.min_index,
-                max: self.max_index,
-            });
-        }
-
-        // Get offset from in-memory index buffer
-        let offset = self.index_store.get_offset(index)
-            .ok_or_else(|| LogSegmentError::IndexOutOfBounds {
-                index,
-                min: self.min_index,
-                max: self.max_index,
-            })?;
-
-        // Zero-copy read from in-memory data buffer
-        let data = self.data_store.get_at_offset(offset).await?;
-        LogEntryView::new(data).map_err(LogSegmentError::ReadError)
-    }
-
-    fn min_index(&self) -> u32 {
-        self.min_index
-    }
-
-    fn max_index(&self) -> u32 {
-        self.max_index
-    }
-}
-
-
-/// Low-level async trait for the data file backing
-/// Contains the actual log entries in sequential format with headers
-#[async_trait]
-pub trait LogSegmentDataStore: Send + Sync {
-    /// Get entry data at a specific byte offset (zero-copy)
-    async fn get_at_offset(&self, offset: u32) -> Result<&[u8]>;
-
-    /// Append an entry to disk via O_DIRECT
-    /// Returns (offset, byte_length) of the written entry
-    async fn append(&mut self, entry: &[u8]) -> Result<(u32, u32)>;
-
-    /// Flush buffered writes to disk
-    async fn flush(&mut self) -> Result<()>;
-}
-
-/// Low-level async trait for the index file
-/// Maps logical index -> byte offset in data file
-/// Uses 1MB arena-allocated in-memory buffer for reads
-#[async_trait]
-pub trait LogSegmentIndexStore: Send + Sync {
-    /// Write an offset mapping for a given index
-    /// Must be persisted before making the entry visible to reads
-    async fn write_offset(&mut self, index: u32, offset: u32) -> Result<()>;
-
-    /// Get the byte offset for a logical index from in-memory buffer
-    fn get_offset(&self, index: u32) -> Option<u32>;
-
-    /// Get the current maximum index
-    fn max_index(&self) -> u32;
-
-    /// Get the minimum index
-    fn min_index(&self) -> u32;
-
-    /// Flush index writes to disk
-    async fn flush(&mut self) -> Result<()>;
-}
-
-/// Custom errors for log entry validation
-#[derive(Debug, thiserror::Error)]
-pub enum LogEntryError {
-    #[error("Entry too small: expected at least {expected} bytes, got {actual}")]
-    TooSmall { expected: usize, actual: usize },
-
-    #[error("Invalid byte length: {0}")]
-    InvalidByteLength(usize),
-
-    #[error("Header CRC mismatch: expected {expected:#x}, got {actual:#x}")]
-    HeaderCrcMismatch { expected: u32, actual: u32 },
-
-    #[error("Message CRC mismatch: expected {expected:#x}, got {actual:#x}")]
-    MessageCrcMismatch { expected: u32, actual: u32 },
 
     #[error("Serialization error: {0}")]
     SerializationError(String),
 }
 
+/// Maximum segment size in bytes (1 MB)
+const MAX_SEGMENT_SIZE: u32 = 1024 * 1024;
 
-// Raw header format on disk
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct LogEntryHeader {
-    byte_length: u32,
-    version: u32,
-    header_crc: u32,
-    message_crc: u32,
+/// Compile-time function to estimate entry size for a given data type.
+/// Uses conservative lower bound.
+const fn estimate_entry_size<D: Data>() -> u32 {
+    // TODO: panic if > u32. We cannot handle 4Gb values anyway
+    mem::size_of::<LogValueDeserialized<D>>() as u32
 }
 
-impl LogEntryHeader {
-    const SIZE: usize = std::mem::size_of::<Self>();
+/// Active memory log segment that supports both reading and writing
+/// Uses a pre-allocated Vec for efficient storage of log entries.
+/// 
+/// This is a DUMB implementation that will be replaced. Using
+/// UnsafeCells here as a bit of a learning exercise. 
+pub struct ActiveMemoryLogSegment<D: Data> {
+    lock: RwLock<()>,
+    /// Vector of log entries (protected by RwLock for thread-safety)
+    entries: UnsafeCell<Vec<LogValueDeserialized<D>>>,
+    /// Current approximate size in bytes (protected by RwLock)
+    current_size: UnsafeCell<u32>,
+    /// Index within the log segment
+    /// that the next write will take
+    /// place at.
+    write_index: UnsafeCell<u32>,
+    /// The index in the global log
+    /// that this segment starts at and should
+    /// not be mutated.
+    log_index_offset: u32,
+}
 
-    /// Calculate CRC32 of header (excluding the header_crc field itself)
-    fn calculate_header_crc(&self) -> u32 {
-        let mut digest = Digest::new(Crc32IsoHdlc);
-        digest.write(&self.byte_length.to_le_bytes());
-        digest.write(&self.version.to_le_bytes());
-        digest.write(&self.message_crc.to_le_bytes());
-        digest.finalize() as u32
+// SAFETY: ActiveMemoryLogSegment uses internal RwLock for synchronization,
+// making it safe to send across thread boundaries and share between threads.
+// All mutable access to internal state (entries, current_size, write_index)
+// is protected by the RwLock. log_index_offset is immutable after creation.
+unsafe impl<D: Data> Send for ActiveMemoryLogSegment<D> {}
+
+unsafe impl<D: Data> Sync for ActiveMemoryLogSegment<D> {}
+
+impl<D: Data> ActiveMemoryLogSegment<D> {
+    /// Create a new active memory log segment with pre-allocated capacity
+    pub fn new(log_index_offset: u32) -> Self {
+        let estimated_entry_size = estimate_entry_size::<D>();
+        let estimated_entries = MAX_SEGMENT_SIZE / estimated_entry_size.max(1);
+
+        Self {
+            entries: UnsafeCell::new(Vec::with_capacity(estimated_entries as usize)),
+            lock: RwLock::new(()),
+            current_size: UnsafeCell::new(0),
+            write_index: UnsafeCell::new(0), // max < min when empty
+            log_index_offset,
+        }
     }
 
-    /// Calculate CRC32C of message data
-    fn calculate_message_crc(data: &[u8]) -> u32 {
-        let mut digest = Digest::new(Crc32IsoHdlc);
-        digest.write(data);
-        digest.finalize() as u32
+    /// Get the current size in bytes
+    pub fn size(&self) -> u32 {
+        let _lock = self.lock.read();
+        // SAFETY: We hold the read lock, so no writers can modify current_size
+        unsafe { *self.current_size.get() }
+    }
+
+    /// Check if the segment is full
+    pub fn is_full(&self) -> bool {
+        let _lock = self.lock.read();
+        // SAFETY: We hold the read lock, so no writers can modify current_size
+        unsafe { *self.current_size.get() >= MAX_SEGMENT_SIZE }
+    }
+
+    /// Approximate size of a LogValueDeserialized entry
+    fn approximate_entry_size(entry: &LogValueDeserialized<D>) -> u32 {
+        (mem::size_of::<u128>() // key
+            + mem::size_of::<D>() // data (conservative estimate)
+            + entry.metadata.iter().map(|(k, v)| k.len() + v.len()).sum::<usize>() // metadata
+            + mem::size_of::<Vec<(String, String)>>() // Vec overhead
+            ) as u32 // TODO: panic or error on wrap. 
     }
 }
 
-/// Builder for creating log entries with proper CRC validation
-pub struct LogEntry {
-    message: Vec<u8>,
-}
+#[async_trait]
+impl<D: Data + Clone> LogSegmentWriter<D> for ActiveMemoryLogSegment<D> {
+    async fn append(&self, log_value: LogValueDeserialized<D>) -> Result<u32, LogSegmentError> {
+        let entry_size = Self::approximate_entry_size(&log_value);
 
-impl LogEntry {
-    /// Create a new log entry from a LogValue
-    pub fn from_log_value(log_value: &LogValue) -> Result<Self, LogEntryError> {
-        let message = rkyv::to_bytes::<rkyv::rancor::Error>(log_value)
-            .map_err(|e| LogEntryError::SerializationError(format!("{}", e)))?
-            .to_vec();
-        Ok(Self { message })
-    }
+        let _lock = self.lock.write();
 
-    /// Create a new log entry from raw message bytes
-    pub fn from_bytes(message: Vec<u8>) -> Self {
-        Self { message }
-    }
-
-    /// Build the complete entry with header and CRCs
-    pub fn build(&self) -> Vec<u8> {
-        let message_crc = LogEntryHeader::calculate_message_crc(&self.message);
-        let byte_length = (LogEntryHeader::SIZE + self.message.len()) as u32;
-
-        let mut header = LogEntryHeader {
-            byte_length,
-            version: 1,
-            header_crc: 0,
-            message_crc,
-        };
-        header.header_crc = header.calculate_header_crc();
-
-        let mut entry = Vec::with_capacity(byte_length as usize);
-        // Write header as raw bytes
+        // SAFETY: We hold the write lock, so we have exclusive access to modify the fields
         unsafe {
-            let header_bytes = std::slice::from_raw_parts(
-                &header as *const _ as *const u8,
-                LogEntryHeader::SIZE,
-            );
-            entry.extend_from_slice(header_bytes);
+            let entries = &mut *self.entries.get();
+            let current_size = &mut *self.current_size.get();
+            let write_index = &mut *self.write_index.get();
+
+            if *current_size + entry_size > MAX_SEGMENT_SIZE {
+                return Err(LogSegmentError::WriteError(
+                    format!("Segment full: {} + {} > {}", *current_size, entry_size, MAX_SEGMENT_SIZE)
+                ));
+            }
+
+            entries.push(log_value);
+            *current_size += entry_size;
+            *write_index += 1;
+
+            Ok(*write_index - 1)
         }
-        entry.extend_from_slice(&self.message);
-        entry
     }
 
-    /// Get the message size
-    pub fn message_len(&self) -> usize {
-        self.message.len()
+    async fn seal(self) -> Result<(), LogSegmentError> {
+        let _lock = self.lock.write();
+        // In a real implementation, you might store this sealed segment somewhere
+        // For now, we just consume self and return success
+        Ok(())
     }
 
-    /// Get the total entry size (header + message)
-    pub fn total_len(&self) -> usize {
-        LogEntryHeader::SIZE + self.message.len()
+    fn min_index(&self) -> u32 {
+        let _lock = self.lock.read();
+        self.log_index_offset
+    }
+
+    fn max_index(&self) -> u32 {
+        let _lock = self.lock.read();
+        // SAFETY: We hold the read lock
+        let write_index = unsafe { *self.write_index.get() };
+        self.log_index_to_segment_index(write_index - 1)
+    }
+}
+
+impl<D: Data> ActiveMemoryLogSegment<D> {
+
+    /// Check if empty
+    pub fn is_empty(&self) -> bool {
+        let _lock = self.lock.read();
+        // SAFETY: We hold the read lock
+        unsafe { (*self.entries.get()).is_empty() }
+    }
+
+    #[inline]
+    fn log_index_to_segment_index(&self, i: u32) -> u32 {
+        // No lock needed - log_index_offset is immutable
+        i.saturating_sub(self.log_index_offset)
+    }
+    fn segment_index_to_log_index(&self, i: u32) -> u32 {
+        // No lock needed - log_index_offset is immutable
+        i + (self.log_index_offset)
+    }
+}
+
+#[async_trait]
+impl<D: Data + Clone> LogSegmentReader<D> for ActiveMemoryLogSegment<D> {
+    async fn get(&self, index: u32) -> Result<LogValueDeserialized<D>, LogSegmentError> {
+        let _lock = self.lock.read();
+
+        let index = self.log_index_to_segment_index(index);
+        // SAFETY: We hold the read lock
+        unsafe {
+            let entries = &*self.entries.get();
+            let write_index = *self.write_index.get();
+
+            entries.get(index as usize)
+                .cloned()
+                .ok_or(LogSegmentError::IndexOutOfBounds {
+                    index,
+                    min: 0,
+                    max: self.segment_index_to_log_index(write_index - 1),
+                })
+        }
+    }
+
+    fn min_index(&self) -> u32 {
+        let _lock = self.lock.read();
+        self.log_index_offset
+    }
+
+    fn max_index(&self) -> u32 {
+        let _lock = self.lock.read();
+        // SAFETY: We hold the read lock
+        let write_index = unsafe { *self.write_index.get() };
+        self.log_index_to_segment_index(write_index - 1)
     }
 }
 
 
-// To be used for sealed logs that are not
-// actively being written to. 
-pub struct LogEntryView<'a> {
-    data: &'a [u8],
-    _phantom: PhantomData<&'a LogEntryHeader>,
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde::{Serialize, Deserialize};
 
-// Zero copy view into log entry.
-impl<'a> LogEntryView<'a> {
+    #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
+    struct TestData {
+        value: i32,
+        name: String,
+    }
 
-    pub fn new(data: &'a [u8]) -> Result<Self> {
-        // Validate minimum size
-        if data.len() < LogEntryHeader::SIZE {
-            bail!(LogEntryError::TooSmall {
-                expected: LogEntryHeader::SIZE,
-                actual: data.len()
-            });
-        }
+    #[tokio::test]
+    async fn test_active_segment_append() {
+        let segment = ActiveMemoryLogSegment::<TestData>::new(0);
 
-        let byte_length = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
-        if byte_length < LogEntryHeader::SIZE {
-            bail!(LogEntryError::InvalidByteLength(byte_length));
-        }
-        if data.len() < byte_length {
-            bail!(LogEntryError::TooSmall {
-                expected: byte_length,
-                actual: data.len()
-            });
-        }
-
-        // Create view with validated data
-        let view = LogEntryView {
-            data: &data[..byte_length],
-            _phantom: PhantomData,
+        let entry = LogValueDeserialized {
+            key: 123,
+            data: TestData {
+                value: 42,
+                name: "test".to_string(),
+            },
+            metadata: vec![],
         };
 
-        // Verify header CRC
-        let header = view.header();
-        let calculated_header_crc = header.calculate_header_crc();
-        if calculated_header_crc != header.header_crc {
-            bail!(LogEntryError::HeaderCrcMismatch {
-                expected: header.header_crc,
-                actual: calculated_header_crc
-            });
-        }
-
-        // Verify message CRC
-        let message = view.message();
-        let calculated_message_crc = LogEntryHeader::calculate_message_crc(message);
-        if calculated_message_crc != header.message_crc {
-            bail!(LogEntryError::MessageCrcMismatch {
-                expected: header.message_crc,
-                actual: calculated_message_crc
-            });
-        }
-
-        Ok(view)
+        let index = segment.append(entry).await.unwrap();
+        assert_eq!(index, 0);
+        assert_eq!(LogSegmentWriter::min_index(&segment), 0);
+        assert_eq!(LogSegmentWriter::max_index(&segment), 0);
     }
 
-    /// Get header as a reference (zero-copy)
-    fn header(&self) -> &'a LogEntryHeader {
-        unsafe { &*(self.data.as_ptr() as *const LogEntryHeader) }
+    #[tokio::test]
+    async fn test_active_segment_read() {
+        let segment = ActiveMemoryLogSegment::<TestData>::new(0);
+
+        let entry = LogValueDeserialized {
+            key: 123,
+            data: TestData {
+                value: 42,
+                name: "test".to_string(),
+            },
+            metadata: vec![],
+        };
+
+        segment.append(entry).await.unwrap();
+
+        // Use the LogSegmentReader trait to get the entry
+        let retrieved = LogSegmentReader::get(&segment, 0).await.unwrap();
+        assert_eq!(retrieved.key, 123);
+        assert_eq!(retrieved.data.value, 42);
+        assert_eq!(retrieved.data.name, "test");
     }
 
-    pub fn byte_length(&self) -> u32 {
-        self.header().byte_length
-    }
-
-    pub fn version(&self) -> u32 {
-        self.header().version
-    }
-
-    pub fn header_crc(&self) -> u32 {
-        self.header().header_crc
-    }
-
-    pub fn message_crc(&self) -> u32 {
-        self.header().message_crc
-    }
-
-    /// Get message portion (zero-copy)
-    pub fn message(&self) -> &'a [u8] {
-        &self.data[LogEntryHeader::SIZE..]
-    }
-
-    /// Get the entire raw bytes
-    pub fn as_bytes(&self) -> &'a [u8] {
-        self.data
-    }
-
-    /// Parse message as archived LogValue (zero-copy)
-    pub fn as_log_value(&self) -> Result<ArchivedLogValueView<'a>> {
-        ArchivedLogValueView::new(self.message())
-            .context("Failed to parse message as LogValue")
-    }
-}
-
-pub struct LogEntryIter<'a> {
-    data: &'a [u8],
-    offset: usize,
-}
-
-impl<'a> Iterator for LogEntryIter<'a> {
-    type Item = Result<LogEntryView<'a>>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.offset >= self.data.len() {
-            return None;
-        }
-
-        match LogEntryView::new(&self.data[self.offset..]) {
-            Ok(entry) => {
-                let entry_len = entry.byte_length() as usize;
-                self.offset += entry_len;
-                Some(Ok(entry))
-            }
-            Err(e) => Some(Err(e)),
-        }
-    }
+    // TODO: Uncomment when SealedMemoryLogSegment is implemented
+    // #[tokio::test]
+    // async fn test_sealed_segment_read_only() {
+    //     let mut active = ActiveMemoryLogSegment::<TestData>::new(0);
+    //
+    //     let entry = LogValueDeserialized {
+    //         key: 456,
+    //         data: TestData {
+    //             value: 99,
+    //             name: "sealed".to_string(),
+    //         },
+    //         metadata: vec![],
+    //     };
+    //
+    //     active.append(entry).await.unwrap();
+    //     let sealed = SealedMemoryLogSegment::from(active);
+    //
+    //     let retrieved = sealed.get(0).await.unwrap();
+    //     assert_eq!(retrieved.key, 456);
+    // }
 }
