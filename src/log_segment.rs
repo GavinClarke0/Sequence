@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use parking_lot::{RwLock};
-use std::{mem, cell::UnsafeCell};
+use std::mem;
 use crate::log_value::{LogValueDeserialized, Data};
 
 
@@ -59,34 +59,24 @@ const fn estimate_entry_size<D: Data>() -> u32 {
     mem::size_of::<LogValueDeserialized<D>>() as u32
 }
 
-/// Active memory log segment that supports both reading and writing
-/// Uses a pre-allocated Vec for efficient storage of log entries.
-/// 
-/// This is a DUMB implementation that will be replaced. Using
-/// UnsafeCells here as a bit of a learning exercise. 
-pub struct ActiveMemoryLogSegment<D: Data> {
-    lock: RwLock<()>,
-    /// Vector of log entries (protected by RwLock for thread-safety)
-    entries: UnsafeCell<Vec<LogValueDeserialized<D>>>,
-    /// Current approximate size in bytes (protected by RwLock)
-    current_size: UnsafeCell<u32>,
-    /// Index within the log segment
-    /// that the next write will take
-    /// place at.
-    write_index: UnsafeCell<u32>,
-    /// The index in the global log
-    /// that this segment starts at and should
-    /// not be mutated.
-    log_index_offset: u32,
+/// Inner state of the active memory log segment - all mutable fields
+struct ActiveMemoryLogSegmentInner<D: Data> {
+    /// Vector of log entries
+    entries: Vec<LogValueDeserialized<D>>,
+    /// Current approximate size in bytes
+    current_size: u32,
+    /// Index within the log segment that the next write will take place at
+    write_index: u32,
 }
 
-// SAFETY: ActiveMemoryLogSegment uses internal RwLock for synchronization,
-// making it safe to send across thread boundaries and share between threads.
-// All mutable access to internal state (entries, current_size, write_index)
-// is protected by the RwLock. log_index_offset is immutable after creation.
-unsafe impl<D: Data> Send for ActiveMemoryLogSegment<D> {}
-
-unsafe impl<D: Data> Sync for ActiveMemoryLogSegment<D> {}
+/// Active memory log segment that supports both reading and writing
+/// Uses a single RwLock around inner state - 100% safe Rust
+pub struct ActiveMemoryLogSegment<D: Data> {
+    /// All mutable state protected by a single RwLock
+    inner: RwLock<ActiveMemoryLogSegmentInner<D>>,
+    /// The index in the global log that this segment starts at (immutable)
+    log_index_offset: u32,
+}
 
 impl<D: Data> ActiveMemoryLogSegment<D> {
     /// Create a new active memory log segment with pre-allocated capacity
@@ -95,26 +85,23 @@ impl<D: Data> ActiveMemoryLogSegment<D> {
         let estimated_entries = MAX_SEGMENT_SIZE / estimated_entry_size.max(1);
 
         Self {
-            entries: UnsafeCell::new(Vec::with_capacity(estimated_entries as usize)),
-            lock: RwLock::new(()),
-            current_size: UnsafeCell::new(0),
-            write_index: UnsafeCell::new(0), // max < min when empty
+            inner: RwLock::new(ActiveMemoryLogSegmentInner {
+                entries: Vec::with_capacity(estimated_entries as usize),
+                current_size: 0,
+                write_index: 0,
+            }),
             log_index_offset,
         }
     }
 
     /// Get the current size in bytes
     pub fn size(&self) -> u32 {
-        let _lock = self.lock.read();
-        // SAFETY: We hold the read lock, so no writers can modify current_size
-        unsafe { *self.current_size.get() }
+        self.inner.read().current_size
     }
 
     /// Check if the segment is full
     pub fn is_full(&self) -> bool {
-        let _lock = self.lock.read();
-        // SAFETY: We hold the read lock, so no writers can modify current_size
-        unsafe { *self.current_size.get() >= MAX_SEGMENT_SIZE }
+        self.inner.read().current_size >= MAX_SEGMENT_SIZE
     }
 
     /// Approximate size of a LogValueDeserialized entry
@@ -132,45 +119,34 @@ impl<D: Data + Clone> LogSegmentWriter<D> for ActiveMemoryLogSegment<D> {
     async fn append(&self, log_value: LogValueDeserialized<D>) -> Result<u32, LogSegmentError> {
         let entry_size = Self::approximate_entry_size(&log_value);
 
-        let _lock = self.lock.write();
+        let mut inner = self.inner.write();
 
-        // SAFETY: We hold the write lock, so we have exclusive access to modify the fields
-        unsafe {
-            let entries = &mut *self.entries.get();
-            let current_size = &mut *self.current_size.get();
-            let write_index = &mut *self.write_index.get();
-
-            if *current_size + entry_size > MAX_SEGMENT_SIZE {
-                return Err(LogSegmentError::WriteError(
-                    format!("Segment full: {} + {} > {}", *current_size, entry_size, MAX_SEGMENT_SIZE)
-                ));
-            }
-
-            entries.push(log_value);
-            *current_size += entry_size;
-            *write_index += 1;
-
-            Ok(*write_index - 1)
+        if inner.current_size + entry_size > MAX_SEGMENT_SIZE {
+            return Err(LogSegmentError::WriteError(
+                format!("Segment full: {} + {} > {}", inner.current_size, entry_size, MAX_SEGMENT_SIZE)
+            ));
         }
+
+        inner.entries.push(log_value);
+        inner.current_size += entry_size;
+        inner.write_index += 1;
+
+        Ok(inner.write_index - 1)
     }
 
     async fn seal(self) -> Result<(), LogSegmentError> {
-        let _lock = self.lock.write();
         // In a real implementation, you might store this sealed segment somewhere
         // For now, we just consume self and return success
         Ok(())
     }
 
     fn min_index(&self) -> u32 {
-        let _lock = self.lock.read();
         self.log_index_offset
     }
 
     fn max_index(&self) -> u32 {
-        let _lock = self.lock.read();
-        // SAFETY: We hold the read lock
-        let write_index = unsafe { *self.write_index.get() };
-        self.log_index_to_segment_index(write_index - 1)
+        let inner = self.inner.read();
+        self.log_index_to_segment_index(inner.write_index - 1)
     }
 }
 
@@ -178,9 +154,7 @@ impl<D: Data> ActiveMemoryLogSegment<D> {
 
     /// Check if empty
     pub fn is_empty(&self) -> bool {
-        let _lock = self.lock.read();
-        // SAFETY: We hold the read lock
-        unsafe { (*self.entries.get()).is_empty() }
+        self.inner.read().entries.is_empty()
     }
 
     #[inline]
@@ -197,34 +171,25 @@ impl<D: Data> ActiveMemoryLogSegment<D> {
 #[async_trait]
 impl<D: Data + Clone> LogSegmentReader<D> for ActiveMemoryLogSegment<D> {
     async fn get(&self, index: u32) -> Result<LogValueDeserialized<D>, LogSegmentError> {
-        let _lock = self.lock.read();
-
+        let inner = self.inner.read();
         let index = self.log_index_to_segment_index(index);
-        // SAFETY: We hold the read lock
-        unsafe {
-            let entries = &*self.entries.get();
-            let write_index = *self.write_index.get();
 
-            entries.get(index as usize)
-                .cloned()
-                .ok_or(LogSegmentError::IndexOutOfBounds {
-                    index,
-                    min: 0,
-                    max: self.segment_index_to_log_index(write_index - 1),
-                })
-        }
+        inner.entries.get(index as usize)
+            .cloned()
+            .ok_or(LogSegmentError::IndexOutOfBounds {
+                index,
+                min: 0,
+                max: self.segment_index_to_log_index(inner.write_index - 1),
+            })
     }
 
     fn min_index(&self) -> u32 {
-        let _lock = self.lock.read();
         self.log_index_offset
     }
 
     fn max_index(&self) -> u32 {
-        let _lock = self.lock.read();
-        // SAFETY: We hold the read lock
-        let write_index = unsafe { *self.write_index.get() };
-        self.log_index_to_segment_index(write_index - 1)
+        let inner = self.inner.read();
+        self.log_index_to_segment_index(inner.write_index - 1)
     }
 }
 
