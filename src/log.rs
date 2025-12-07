@@ -1,8 +1,11 @@
-use parking_lot::RwLock;
-use std::sync::Arc;
-use std::marker::PhantomData;
-use crate::log_segment::{LogSegmentWriter, LogSegmentReader, LogSegmentError};
-use crate::log_value::{Data, LogValueDeserialized};
+use crate::log_segment::LogSegmentError;
+use crate::log_value::{LogData, LogValueDeserialized, LogValueSerialized};
+use async_trait::async_trait;
+use fjall::compaction::Fifo;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
+
+use fjall::{compaction::Strategy, Config, Keyspace, PartitionCreateOptions, PartitionHandle};
 
 #[derive(Debug, thiserror::Error)]
 pub enum LogError {
@@ -14,234 +17,172 @@ pub enum LogError {
 
     #[error("Log is empty")]
     LogEmpty,
+
+    #[error("Database error: {0}")]
+    DatabaseError(#[from] fjall::Error),
+
+    #[error("Serialization error: {0}")]
+    SerializationError(String),
 }
 
-/// Trait for managing log state (segments and indices)
-/// Implementations must be Send + Sync for concurrent access
-pub trait LogState<D: Data, S>: Send + Sync
-where
-    S: LogSegmentWriter<D> + LogSegmentReader<D>,
-{
-    /// Get the current active segment (cheap clone of Arc)
-    fn active_segment(&self) -> Arc<S>;
+type LogId = String;
 
-    /// Get all sealed segments (clones Arcs)
-    fn sealed_segments(&self) -> Vec<Arc<S>>;
 
-    /// Attempt to rotate the active segment if it matches the expected current segment
-    /// Returns true if rotation occurred
-    fn try_rotate_segment(&self, expected_current: &Arc<S>, new_segment: S) -> bool;
-
-    /// Find the segment containing the given index
-    fn find_segment_for_read(&self, index: u32) -> Option<Arc<S>>;
-
-    /// Get the next available index (atomically if possible)
-    fn next_index(&self) -> u32;
+#[async_trait]
+pub trait Log<D: LogData> {
+    fn id(&self) -> &LogId;
+    async fn append(&self, log_value: LogValueDeserialized<D>) -> Result<u32, LogError>;
+    async fn get(&self, index: u32) -> Result<LogValueDeserialized<D>, LogError>;
+    async fn size_bytes(&self) -> u64;
 }
 
-/// Atomic implementation of LogState using Arc and atomics for thread safety
-pub struct AtomicLogState<D: Data, S>
-where
-    S: LogSegmentWriter<D> + LogSegmentReader<D>,
-{
-    /// Active segment protected by RwLock for rotation
-    active: RwLock<Arc<S>>,
-    /// Sealed segments protected by RwLock
-    sealed: RwLock<Vec<Arc<S>>>,
-    /// Phantom data for D
-    _phantom: PhantomData<D>,
+/// Block cache size for fjall database (64 MB)
+const FJALL_MEM_CACHE_SIZE: u64 = 64 * 1024 * 1024;
+/// Max stored data in partition before oldest segments
+/// are dropped.
+const FJALL_LOG_MAX_SIZE: u64 = 64 * 1024 * 1024;
+/// Time-to-live for log entries (None = no TTL)
+const FJALL_LOG_TTL: Option<u64> = None;
+/// Number of flush worker threads for memtable flushing
+const FJALL_FLUSH_WORKERS: usize = 2;
+/// Number of compaction worker threads for LSM tree compaction
+const FJALL_COMPACTION_WORKERS: usize = 2;
+
+pub struct FjallLog {
+    log_id: LogId,
+    partition: PartitionHandle,
+    /// Atomic counter for the next available index
+    next_index: AtomicU32,
 }
 
-impl<D: Data, S> AtomicLogState<D, S>
-where
-    S: LogSegmentWriter<D> + LogSegmentReader<D>,
-{
-    pub fn new(initial_segment: S) -> Self {
-        Self {
-            active: RwLock::new(Arc::new(initial_segment)),
-            sealed: RwLock::new(Vec::new()),
-            _phantom: PhantomData,
-        }
-    }
-}
+impl FjallLog {
+    /// Create a new FjallLog with the given partition, inferring the next index from existing data
+    pub fn new(log_id: LogId, partition: PartitionHandle) -> Result<Self, LogError> {
+        let next_index_value = Self::infer_next_index(&partition)?;
+        let next_index = AtomicU32::new(next_index_value);
 
-impl<D: Data, S> LogState<D, S> for AtomicLogState<D, S>
-where
-    S: LogSegmentWriter<D> + LogSegmentReader<D>,
-{
-    fn active_segment(&self) -> Arc<S> {
-        Arc::clone(&*self.active.read())
+        Ok(FjallLog {
+            log_id,
+            partition,
+            next_index,
+        })
     }
 
-    fn sealed_segments(&self) -> Vec<Arc<S>> {
-        self.sealed.read().clone()
-    }
+    /// Scan the partition to find the maximum index and initialize next_index
+    fn infer_next_index(partition: &PartitionHandle) -> Result<u32, LogError> {
+        let mut max_index: Option<u32> = None;
 
-    fn try_rotate_segment(&self, expected_current: &Arc<S>, new_segment: S) -> bool {
-        let mut active = self.active.write();
-
-        // Check if still the same segment (another thread might have rotated)
-        if Arc::ptr_eq(&*active, expected_current) {
-            let old_active = std::mem::replace(&mut *active, Arc::new(new_segment));
-            self.sealed.write().push(old_active);
-            true
-        } else {
-            false
-        }
-    }
-
-    fn find_segment_for_read(&self, index: u32) -> Option<Arc<S>> {
-        // Check sealed segments first
-        for seg in self.sealed.read().iter() {
-            if !LogSegmentReader::is_empty(seg.as_ref())
-                && index >= LogSegmentReader::min_index(seg.as_ref())
-                && index <= LogSegmentReader::max_index(seg.as_ref()) {
-                return Some(Arc::clone(seg));
+        // Last key must be highest valued index since we use BE u32 as indexes. 
+        if let Some(kv) = partition.last_key_value()? {
+            let (key, _) = kv; 
+            if key.len() == 4 {
+                if let Ok(key_bytes) = <[u8; 4]>::try_from(key.as_ref()) {
+                    let index = u32::from_be_bytes(key_bytes);
+                    max_index = Some(max_index.map_or(index, |max| max.max(index)));
+                }
             }
         }
 
-        // Check active segment
-        let active = self.active_segment();
-        if !LogSegmentReader::is_empty(active.as_ref())
-            && index >= LogSegmentReader::min_index(active.as_ref())
-            && index <= LogSegmentReader::max_index(active.as_ref()) {
-            return Some(active);
-        }
-
-        None
+        // Next index is max_index + 1, or 0 if no entries exist
+        Ok(max_index.map_or(0, |max| max.saturating_add(1)))
     }
 
-    fn next_index(&self) -> u32 {
-        // For now, get from active segment
-        // Can be optimized with AtomicU32 if needed
-        let active = self.active.read();
-        if LogSegmentReader::is_empty(active.as_ref()) {
-            LogSegmentWriter::min_index(active.as_ref())
-        } else {
-            LogSegmentWriter::max_index(active.as_ref()) + 1
-        }
+    /// Get the current index and increment atomically
+    fn get_and_increment_index(&self) -> u32 {
+        self.next_index.fetch_add(1, Ordering::SeqCst)
     }
 }
 
-/// Log - contains all business logic for managing segments
-/// Generic over segment implementation and state management
-pub struct Log<D: Data, S, State>
-where
-    S: LogSegmentWriter<D> + LogSegmentReader<D>,
-    State: LogState<D, S>,
-{
-    state: State,
-    _phantom: PhantomData<(D, S)>,
-}
-
-impl<D: Data + Clone, S, State> Log<D, S, State>
-where
-    S: LogSegmentWriter<D> + LogSegmentReader<D>,
-    State: LogState<D, S>,
-{
-    /// Create a new log with the given state
-    pub fn new(state: State) -> Self {
-        Self {
-            state,
-            _phantom: PhantomData,
-        }
+#[async_trait]
+impl<D: LogData> Log<D> for FjallLog {
+    fn id(&self) -> &LogId {
+        &self.log_id
     }
 
-    /// Append a log value and return its assigned global index
-    pub async fn append(&self, log_value: LogValueDeserialized<D>, new_segment_fn: impl Fn(u32) -> S) -> Result<u32, LogError> {
-        loop {
-            // Get active segment (cheap Arc clone)
-            let active_segment = self.state.active_segment();
+    async fn append(&self, log_value: LogValueDeserialized<D>) -> Result<u32, LogError> {
+        // Get current index and increment
+        let index = self.get_and_increment_index();
 
-            // Try to append without holding any locks
-            let result = active_segment.append(log_value.clone()).await;
+        // Serialize using the LogData trait implementation
+        let serialized = log_value
+            .to_serialized()
+            .map_err(|e| LogError::SerializationError(e.to_string()))?;
 
-            match result {
-                Ok(index) => {
-                    return Ok(index);
-                }
-                Err(LogSegmentError::WriteError(_)) => {
-                    // Segment is full - try to rotate
-                    let next_index = self.state.next_index();
-                    let new_segment = new_segment_fn(next_index);
+        // Serialize with rkyv for storage. Todo: use arena.
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&serialized)
+            .map_err(|e| LogError::SerializationError(e.to_string()))?;
 
-                    // Try to rotate (atomically checks if still the same segment)
-                    self.state.try_rotate_segment(&active_segment, new_segment);
+        // Store in partition with index as key
+        let key = index.to_be_bytes();
+        self.partition.insert(key, bytes.as_ref())?;
 
-                    // Loop will retry with (potentially) new active segment
-                }
-                Err(e) => return Err(LogError::SegmentError(e)),
-            }
-        }
+        Ok(index)
     }
 
-    /// Get a log value by its global index
-    pub async fn get(&self, index: u32) -> Result<LogValueDeserialized<D>, LogError> {
-        // Find the segment (uses state's optimized search)
-        let segment = self.state.find_segment_for_read(index)
+    async fn get(&self, index: u32) -> Result<LogValueDeserialized<D>, LogError> {
+        // Retrieve from partition
+        let key = index.to_be_bytes();
+        let value = self.partition
+            .get(key)?
             .ok_or(LogError::IndexNotFound(index))?;
 
-        // Read from segment without holding any log-level locks
-        segment.get(index).await.map_err(LogError::SegmentError)
+        // Copy to aligned buffer for rkyv deserialization
+        let mut aligned_bytes: rkyv::util::AlignedVec<16> = rkyv::util::AlignedVec::new();
+        aligned_bytes.extend_from_slice(value.as_ref());
+
+        // Deserialize from rkyv
+        let serialized: LogValueSerialized = rkyv::from_bytes::<LogValueSerialized, rkyv::rancor::Error>(&aligned_bytes)
+            .map_err(|e: rkyv::rancor::Error| LogError::SerializationError(format!("rkyv deserialization failed: {}", e)))?;
+
+        // Deserialize using the LogData trait implementation
+        let deserialized = serialized
+            .to_deserialized()
+            .map_err(|e| LogError::SerializationError(e.to_string()))?;
+
+        Ok(deserialized)
     }
 
-    /// Get the minimum index in the log
-    pub fn min_index(&self) -> Option<u32> {
-        // Check sealed segments first
-        let sealed = self.state.sealed_segments();
-        if let Some(first) = sealed.first() {
-            return Some(LogSegmentReader::min_index(first.as_ref()));
-        }
-
-        // Check active segment
-        let active = self.state.active_segment();
-        if !LogSegmentReader::is_empty(active.as_ref()) {
-            return Some(LogSegmentReader::min_index(active.as_ref()));
-        }
-
-        None
-    }
-
-    /// Get the maximum index in the log
-    pub fn max_index(&self) -> Option<u32> {
-        let active = self.state.active_segment();
-
-        // Check active segment first
-        if !LogSegmentReader::is_empty(active.as_ref()) {
-            return Some(LogSegmentReader::max_index(active.as_ref()));
-        }
-
-        // Fall back to last sealed segment
-        self.state.sealed_segments().last().map(|s| LogSegmentReader::max_index(s.as_ref()))
+    async fn size_bytes(&self) -> u64 {
+        // Use partition's approximate size method
+        self.partition.disk_space() as u64
     }
 }
 
-// ============================================================================
-// Memory Log Implementation
-// ============================================================================
-
-use crate::log_segment::ActiveMemoryLogSegment;
-
-/// Type alias for a memory-backed log with atomic state management
-pub type MemoryLog<D> = Log<D, ActiveMemoryLogSegment<D>, AtomicLogState<D, ActiveMemoryLogSegment<D>>>;
-
-// Helper functions for MemoryLog
-pub fn new_memory_log<D: Data + Clone>() -> MemoryLog<D> {
-    let state = AtomicLogState::new(ActiveMemoryLogSegment::new(0));
-    Log::new(state)
+pub struct FjallDatabaseState {
+    key_space: Keyspace,
 }
 
-pub async fn append_to_memory_log<D: Data + Clone>(
-    log: &MemoryLog<D>,
-    log_value: LogValueDeserialized<D>,
-) -> Result<u32, LogError> {
-    log.append(log_value, |start_index| ActiveMemoryLogSegment::new(start_index)).await
+impl FjallDatabaseState {
+    pub fn new(file_path: PathBuf) -> anyhow::Result<Self> {
+        let key_space = Config::new(file_path)
+            .cache_size(FJALL_MEM_CACHE_SIZE)
+            .flush_workers(FJALL_FLUSH_WORKERS)
+            .compaction_workers(FJALL_COMPACTION_WORKERS)
+            .open()?;
+        Ok(Self { key_space })
+    }
+
+    pub fn new_log(&self, log_id: LogId) -> Result<FjallLog, LogError> {
+        // Configure partition with FIFO compaction strategy
+        let options = PartitionCreateOptions::default()
+            .compaction_strategy(Strategy::Fifo(Fifo{
+                limit: FJALL_LOG_MAX_SIZE,
+                ttl_seconds: FJALL_LOG_TTL, 
+            }));
+
+        let partition = self
+            .key_space
+            .open_partition(&log_id, options)?;
+
+        FjallLog::new(log_id, partition)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde::{Serialize, Deserialize};
+    use serde::{Deserialize, Serialize};
+    use tempfile::TempDir;
 
     #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
     struct TestData {
@@ -249,9 +190,27 @@ mod tests {
         name: String,
     }
 
+    impl LogData for TestData {
+        fn to_bytes(&self) -> anyhow::Result<Vec<u8>> {
+            serde_json::to_vec(self).map_err(|e| anyhow::anyhow!("Serialization failed: {}", e))
+        }
+
+        fn from_bytes(bytes: &[u8]) -> anyhow::Result<Self> {
+            serde_json::from_slice(bytes)
+                .map_err(|e| anyhow::anyhow!("Deserialization failed: {}", e))
+        }
+    }
+
+    fn create_test_db() -> (FjallDatabaseState, TempDir) {
+        let temp_dir = TempDir::new().unwrap();
+        let db_state = FjallDatabaseState::new(temp_dir.path().to_path_buf()).unwrap();
+        (db_state, temp_dir)
+    }
+
     #[tokio::test]
-    async fn test_log_append_single_entry() {
-        let log = new_memory_log::<TestData>();
+    async fn test_create_log_and_append() {
+        let (db_state, _temp_dir) = create_test_db();
+        let log: FjallLog = db_state.new_log("test_log".to_string()).unwrap();
 
         let entry = LogValueDeserialized {
             key: 123,
@@ -262,214 +221,243 @@ mod tests {
             metadata: vec![],
         };
 
-        let index = append_to_memory_log(&log, entry).await.unwrap();
-        assert_eq!(index, 0);
-        assert_eq!(log.min_index(), Some(0));
-        assert_eq!(log.max_index(), Some(0));
+        let index = log.append(entry).await.unwrap();
+        assert_eq!(index, 0, "First entry should have index 0");
     }
 
     #[tokio::test]
-    async fn test_log_append_multiple_entries() {
-        let log = new_memory_log::<TestData>();
-
-        for i in 0..10 {
-            let entry = LogValueDeserialized {
-                key: i as u128,
-                data: TestData {
-                    value: i as i32,
-                    name: format!("entry_{}", i),
-                },
-                metadata: vec![],
-            };
-
-            let index = append_to_memory_log(&log, entry).await.unwrap();
-            assert_eq!(index, i);
-        }
-
-        assert_eq!(log.min_index(), Some(0));
-        assert_eq!(log.max_index(), Some(9));
-    }
-
-    #[tokio::test]
-    async fn test_log_read_from_active_segment() {
-        let log = new_memory_log::<TestData>();
+    async fn test_append_and_read() {
+        let (db_state, _temp_dir) = create_test_db();
+        let log: FjallLog = db_state.new_log("test_log".to_string()).unwrap();
 
         let entry = LogValueDeserialized {
             key: 456,
             data: TestData {
                 value: 99,
-                name: "active".to_string(),
+                name: "hello".to_string(),
             },
-            metadata: vec![],
+            metadata: vec![("key1".to_string(), "value1".to_string())],
         };
 
-        append_to_memory_log(&log, entry).await.unwrap();
+        let index = log.append(entry.clone()).await.unwrap();
 
-        let retrieved = log.get(0).await.unwrap();
+        let retrieved: LogValueDeserialized<TestData> = log.get(index).await.unwrap();
         assert_eq!(retrieved.key, 456);
         assert_eq!(retrieved.data.value, 99);
-        assert_eq!(retrieved.data.name, "active");
+        assert_eq!(retrieved.data.name, "hello");
+        assert_eq!(retrieved.metadata.len(), 1);
+        assert_eq!(retrieved.metadata[0].0, "key1");
+        assert_eq!(retrieved.metadata[0].1, "value1");
     }
 
     #[tokio::test]
-    async fn test_log_read_multiple_entries() {
-        let log = new_memory_log::<TestData>();
+    async fn test_sequential_index_assignment() {
+        let (db_state, _temp_dir) = create_test_db();
+        let log: FjallLog = db_state.new_log("test_log".to_string()).unwrap();
 
-        // Write multiple entries
-        for i in 0..5 {
+        let mut indexes = Vec::new();
+        for i in 0..10 {
             let entry = LogValueDeserialized {
                 key: i as u128,
                 data: TestData {
-                    value: (i * 10) as i32,
+                    value: i,
                     name: format!("entry_{}", i),
                 },
                 metadata: vec![],
             };
-            append_to_memory_log(&log, entry).await.unwrap();
+            let index = log.append(entry).await.unwrap();
+            indexes.push(index);
         }
 
-        // Read them back
-        for i in 0..5 {
-            let retrieved = log.get(i).await.unwrap();
-            assert_eq!(retrieved.key, i as u128);
-            assert_eq!(retrieved.data.value, (i * 10) as i32);
+        assert_eq!(indexes, vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+
+        for (i, &index) in indexes.iter().enumerate() {
+            let retrieved: LogValueDeserialized<TestData> = log.get(index).await.unwrap();
+            assert_eq!(retrieved.data.value, i as i32);
             assert_eq!(retrieved.data.name, format!("entry_{}", i));
         }
     }
 
     #[tokio::test]
-    async fn test_log_empty_read() {
-        let log = new_memory_log::<TestData>();
+    async fn test_index_not_found() {
+        let (db_state, _temp_dir) = create_test_db();
+        let log: FjallLog = db_state.new_log("test_log".to_string()).unwrap();
 
-        let result = log.get(0).await;
+        let result: Result<LogValueDeserialized<TestData>, LogError> = log.get(999).await;
         assert!(result.is_err());
-        match result {
-            Err(LogError::IndexNotFound(0)) => {},
+        match result.unwrap_err() {
+            LogError::IndexNotFound(index) => assert_eq!(index, 999),
             _ => panic!("Expected IndexNotFound error"),
         }
     }
 
     #[tokio::test]
-    async fn test_log_out_of_bounds() {
-        let log = new_memory_log::<TestData>();
+    async fn test_next_index_inference_on_reopen() {
+        let temp_dir = TempDir::new().unwrap();
+        let log_id = "test_log_reopen".to_string();
+
+        {
+            let db_state = FjallDatabaseState::new(temp_dir.path().to_path_buf()).unwrap();
+            let log: FjallLog = db_state.new_log(log_id.clone()).unwrap();
+
+            for i in 0..5 {
+                let entry = LogValueDeserialized {
+                    key: i,
+                    data: TestData {
+                        value: i as i32,
+                        name: format!("entry_{}", i),
+                    },
+                    metadata: vec![],
+                };
+                log.append(entry).await.unwrap();
+            }
+        }
+
+        {
+            let db_state = FjallDatabaseState::new(temp_dir.path().to_path_buf()).unwrap();
+            let log: FjallLog = db_state.new_log(log_id.clone()).unwrap();
+
+            let entry = LogValueDeserialized {
+                key: 100,
+                data: TestData {
+                    value: 100,
+                    name: "new_entry".to_string(),
+                },
+                metadata: vec![],
+            };
+
+            let index = log.append(entry).await.unwrap();
+            assert_eq!(index, 5, "Next index should be 5 after reopening");
+
+            let retrieved: LogValueDeserialized<TestData> = log.get(0).await.unwrap();
+            assert_eq!(retrieved.data.value, 0);
+
+            let retrieved_new: LogValueDeserialized<TestData> = log.get(5).await.unwrap();
+            assert_eq!(retrieved_new.data.value, 100);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_empty_log_next_index() {
+        let (db_state, _temp_dir) = create_test_db();
+        let log: FjallLog = db_state.new_log("empty_log".to_string()).unwrap();
 
         let entry = LogValueDeserialized {
             key: 1,
             data: TestData {
                 value: 1,
-                name: "test".to_string(),
+                name: "first".to_string(),
             },
             metadata: vec![],
         };
 
-        append_to_memory_log(&log, entry).await.unwrap();
+        let index = log.append(entry).await.unwrap();
+        assert_eq!(index, 0, "Empty log should start at index 0");
+    }
 
-        // Try to read beyond what exists
-        let result = log.get(100).await;
-        assert!(result.is_err());
-        match result {
-            Err(LogError::IndexNotFound(100)) => {},
-            _ => panic!("Expected IndexNotFound error"),
+    #[tokio::test]
+    async fn test_size_bytes() {
+        let (db_state, _temp_dir) = create_test_db();
+        let log = db_state.new_log("test_log".to_string()).unwrap();
+
+        let initial_size = <FjallLog as Log<TestData>>::size_bytes(&log).await;
+
+        let entry = LogValueDeserialized {
+            key: 1,
+            data: TestData {
+                value: 42,
+                name: "test_data".to_string(),
+            },
+            metadata: vec![],
+        };
+
+        <FjallLog as Log<TestData>>::append(&log, entry).await.unwrap();
+
+        let after_append_size = <FjallLog as Log<TestData>>::size_bytes(&log).await;
+        assert!(
+            after_append_size >= initial_size,
+            "Size should increase after appending data"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_appends() {
+        let (db_state, _temp_dir) = create_test_db();
+        let log = std::sync::Arc::new(db_state.new_log("concurrent_log".to_string()).unwrap());
+
+        let mut handles = vec![];
+        for i in 0..10 {
+            let log_clone = log.clone();
+            let handle = tokio::spawn(async move {
+                let entry = LogValueDeserialized {
+                    key: i,
+                    data: TestData {
+                        value: i as i32,
+                        name: format!("concurrent_{}", i),
+                    },
+                    metadata: vec![],
+                };
+                log_clone.append(entry).await.unwrap()
+            });
+            handles.push(handle);
+        }
+
+        let mut indexes = vec![];
+        for handle in handles {
+            indexes.push(handle.await.unwrap());
+        }
+
+        indexes.sort();
+        assert_eq!(indexes, vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+
+        for index in 0..10 {
+            let retrieved: LogValueDeserialized<TestData> = log.get(index).await.unwrap();
+            assert!(retrieved.data.value >= 0 && retrieved.data.value < 10);
         }
     }
 
     #[tokio::test]
-    async fn test_log_segment_rotation() {
-        let log = new_memory_log::<TestData>();
+    async fn test_log_id() {
+        let (db_state, _temp_dir) = create_test_db();
+        let log = db_state.new_log("my_test_log".to_string()).unwrap();
 
-        // Create large entries to force segment rotation
-        let large_string = "x".repeat(10_000); // 10KB per entry
-
-        let mut indices = vec![];
-        for i in 0..150 {  // This should trigger at least one rotation
-            let entry = LogValueDeserialized {
-                key: i as u128,
-                data: TestData {
-                    value: i as i32,
-                    name: large_string.clone(),
-                },
-                metadata: vec![],
-            };
-
-            let index = append_to_memory_log(&log, entry).await.unwrap();
-            indices.push(index);
-        }
-
-        // Verify indices are sequential
-        for (i, &index) in indices.iter().enumerate() {
-            assert_eq!(index, i as u32);
-        }
-
-        // Verify min/max
-        assert_eq!(log.min_index(), Some(0));
-        assert_eq!(log.max_index(), Some(149));
-
-        // Verify we can read across segments
-        for i in 0..150 {
-            let retrieved = log.get(i).await.unwrap();
-            assert_eq!(retrieved.key, i as u128);
-            assert_eq!(retrieved.data.value, i as i32);
-        }
+        assert_eq!(<FjallLog as Log<TestData>>::id(&log), "my_test_log");
     }
 
     #[tokio::test]
-    async fn test_log_read_from_sealed_segment() {
-        let log = new_memory_log::<TestData>();
+    async fn test_multiple_logs_independent() {
+        let (db_state, _temp_dir) = create_test_db();
+        let log1: FjallLog = db_state.new_log("log1".to_string()).unwrap();
+        let log2: FjallLog = db_state.new_log("log2".to_string()).unwrap();
 
-        // Fill up first segment to force rotation
-        let large_string = "x".repeat(10_000);
+        let entry1 = LogValueDeserialized {
+            key: 1,
+            data: TestData {
+                value: 100,
+                name: "log1_entry".to_string(),
+            },
+            metadata: vec![],
+        };
 
-        for i in 0..120 {
-            let entry = LogValueDeserialized {
-                key: i as u128,
-                data: TestData {
-                    value: i as i32,
-                    name: large_string.clone(),
-                },
-                metadata: vec![],
-            };
-            append_to_memory_log(&log, entry).await.unwrap();
-        }
+        let entry2 = LogValueDeserialized {
+            key: 2,
+            data: TestData {
+                value: 200,
+                name: "log2_entry".to_string(),
+            },
+            metadata: vec![],
+        };
 
-        // Now read from what should be a sealed segment (early indices)
-        let retrieved = log.get(0).await.unwrap();
-        assert_eq!(retrieved.key, 0);
-        assert_eq!(retrieved.data.value, 0);
+        let index1 = log1.append(entry1).await.unwrap();
+        let index2 = log2.append(entry2).await.unwrap();
 
-        let retrieved = log.get(50).await.unwrap();
-        assert_eq!(retrieved.key, 50);
-        assert_eq!(retrieved.data.value, 50);
-    }
+        assert_eq!(index1, 0);
+        assert_eq!(index2, 0);
 
-    #[tokio::test]
-    async fn test_log_read_across_segments() {
-        let log = new_memory_log::<TestData>();
+        let retrieved1: LogValueDeserialized<TestData> = log1.get(0).await.unwrap();
+        let retrieved2: LogValueDeserialized<TestData> = log2.get(0).await.unwrap();
 
-        let large_string = "x".repeat(10_000);
-
-        // Write enough to span multiple segments
-        for i in 0..200 {
-            let entry = LogValueDeserialized {
-                key: i as u128,
-                data: TestData {
-                    value: i as i32,
-                    name: large_string.clone(),
-                },
-                metadata: vec![],
-            };
-            append_to_memory_log(&log, entry).await.unwrap();
-        }
-
-        // Read from beginning (sealed segment)
-        let retrieved = log.get(0).await.unwrap();
-        assert_eq!(retrieved.data.value, 0);
-
-        // Read from middle (potentially another sealed segment)
-        let retrieved = log.get(100).await.unwrap();
-        assert_eq!(retrieved.data.value, 100);
-
-        // Read from end (active segment)
-        let retrieved = log.get(199).await.unwrap();
-        assert_eq!(retrieved.data.value, 199);
+        assert_eq!(retrieved1.data.value, 100);
+        assert_eq!(retrieved2.data.value, 200);
     }
 }

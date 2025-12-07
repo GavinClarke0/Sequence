@@ -1,8 +1,7 @@
+use crate::log_value::{Data, LogValueDeserialized};
 use async_trait::async_trait;
-use parking_lot::{RwLock};
+use parking_lot::RwLock;
 use std::mem;
-use crate::log_value::{LogValueDeserialized, Data};
-
 
 /// High-level async trait for writing log entries to an active segment
 #[async_trait]
@@ -108,11 +107,13 @@ impl<D: Data> ActiveMemoryLogSegment<D> {
 
     /// Approximate size of a LogValueDeserialized entry
     fn approximate_entry_size(entry: &LogValueDeserialized<D>) -> u32 {
-        (mem::size_of::<u128>() // key
+        (
+            mem::size_of::<u128>() // key
             + mem::size_of::<D>() // data (conservative estimate)
             + entry.metadata.iter().map(|(k, v)| k.len() + v.len()).sum::<usize>() // metadata
-            + mem::size_of::<Vec<(String, String)>>() // Vec overhead
-            ) as u32 // TODO: panic or error on wrap. 
+            + mem::size_of::<Vec<(String, String)>>()
+            // Vec overhead
+        ) as u32 // TODO: panic or error on wrap. 
     }
 }
 
@@ -124,9 +125,10 @@ impl<D: Data + Clone> LogSegmentWriter<D> for ActiveMemoryLogSegment<D> {
         let mut inner = self.inner.write();
 
         if inner.current_size + entry_size > MAX_SEGMENT_SIZE {
-            return Err(LogSegmentError::WriteError(
-                format!("Segment full: {} + {} > {}", inner.current_size, entry_size, MAX_SEGMENT_SIZE)
-            ));
+            return Err(LogSegmentError::WriteError(format!(
+                "Segment full: {} + {} > {}",
+                inner.current_size, entry_size, MAX_SEGMENT_SIZE
+            )));
         }
 
         inner.entries.push(log_value);
@@ -153,7 +155,6 @@ impl<D: Data + Clone> LogSegmentWriter<D> for ActiveMemoryLogSegment<D> {
 }
 
 impl<D: Data> ActiveMemoryLogSegment<D> {
-
     /// Check if empty
     pub fn is_empty(&self) -> bool {
         self.inner.read().entries.is_empty()
@@ -176,7 +177,9 @@ impl<D: Data + Clone> LogSegmentReader<D> for ActiveMemoryLogSegment<D> {
         let inner = self.inner.read();
         let index = self.log_index_to_segment_index(index);
 
-        inner.entries.get(index as usize)
+        inner
+            .entries
+            .get(index as usize)
             .cloned()
             .ok_or(LogSegmentError::IndexOutOfBounds {
                 index,
@@ -199,11 +202,10 @@ impl<D: Data + Clone> LogSegmentReader<D> for ActiveMemoryLogSegment<D> {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde::{Serialize, Deserialize};
+    use serde::{Deserialize, Serialize};
 
     #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
     struct TestData {

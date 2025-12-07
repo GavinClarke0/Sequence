@@ -1,6 +1,6 @@
-use rkyv::{Archive, Deserialize, Serialize};
 use anyhow::Result;
-use serde::{Serialize as SerdeSerialize, Deserialize as SerdeDeserialize};
+use rkyv::{Archive, Deserialize, Serialize};
+use serde::{Deserialize as SerdeDeserialize, Serialize as SerdeSerialize};
 
 pub type LogValueKey = u128;
 
@@ -18,6 +18,19 @@ pub struct LogValueSerialized {
     pub metadata: Vec<(String, String)>,
 }
 
+/// Trait for data types that can be stored in a log
+/// Users implement this trait to define their own serialization strategy
+pub trait LogData: Send + Sync + 'static {
+    /// Serialize the data to bytes
+    fn to_bytes(&self) -> Result<Vec<u8>>;
+
+    /// Deserialize the data from bytes
+    fn from_bytes(bytes: &[u8]) -> Result<Self>
+    where
+        Self: Sized;
+}
+
+/// Legacy trait alias for backwards compatibility
 /// Trait for data types that can be serialized/deserialized using serde
 /// Supports multiple formats: JSON, Protobuf, MessagePack, etc.
 pub trait Data: SerdeSerialize + for<'de> SerdeDeserialize<'de> + Send + Sync + 'static {}
@@ -25,8 +38,8 @@ pub trait Data: SerdeSerialize + for<'de> SerdeDeserialize<'de> + Send + Sync + 
 /// Blanket implementation - any type meeting the serde bounds is automatically Data
 impl<T> Data for T where T: SerdeSerialize + for<'de> SerdeDeserialize<'de> + Send + Sync + 'static {}
 
-#[derive(Clone)]
-pub struct LogValueDeserialized<D: Data> {
+#[derive(Clone, Debug)]
+pub struct LogValueDeserialized<D> {
     /// 128-bit key
     pub key: LogValueKey,
     /// Dynamic data payload
@@ -37,7 +50,11 @@ pub struct LogValueDeserialized<D: Data> {
 
 impl LogValueSerialized {
     pub fn new(key: u128, data: Vec<u8>, metadata: Vec<(String, String)>) -> Self {
-        LogValueSerialized { key, data, metadata }
+        LogValueSerialized {
+            key,
+            data,
+            metadata,
+        }
     }
 
     /// Deserialize the data payload into a typed value using the specified format
@@ -51,10 +68,7 @@ impl LogValueSerialized {
     /// ```ignore
     /// let deserialized = serialized.into_deserialized(serde_json::from_slice)?;
     /// ```
-    pub fn into_deserialized<D, E, F>(
-        self,
-        deserialize_fn: F,
-    ) -> Result<LogValueDeserialized<D>>
+    pub fn into_deserialized<D, E, F>(self, deserialize_fn: F) -> Result<LogValueDeserialized<D>>
     where
         D: Data,
         E: std::error::Error + Send + Sync + 'static,
@@ -71,11 +85,46 @@ impl LogValueSerialized {
     }
 }
 
-impl<D: Data> LogValueDeserialized<D> {
+impl<D> LogValueDeserialized<D> {
     pub fn new(key: u128, data: D, metadata: Vec<(String, String)>) -> Self {
-        LogValueDeserialized { key, data, metadata }
+        LogValueDeserialized {
+            key,
+            data,
+            metadata,
+        }
     }
+}
 
+/// Implementation for types that implement LogData trait
+impl<D: LogData> LogValueDeserialized<D> {
+    /// Serialize using the LogData trait implementation
+    pub fn to_serialized(self) -> Result<LogValueSerialized> {
+        let data = self.data.to_bytes()?;
+
+        Ok(LogValueSerialized {
+            key: self.key,
+            data,
+            metadata: self.metadata,
+        })
+    }
+}
+
+/// Implementation for LogValueSerialized with LogData
+impl LogValueSerialized {
+    /// Deserialize using the LogData trait implementation
+    pub fn to_deserialized<D: LogData>(self) -> Result<LogValueDeserialized<D>> {
+        let data = D::from_bytes(&self.data)?;
+
+        Ok(LogValueDeserialized {
+            key: self.key,
+            data,
+            metadata: self.metadata,
+        })
+    }
+}
+
+/// Legacy implementation for types that implement Data trait (serde-based)
+impl<D: Data> LogValueDeserialized<D> {
     /// Serialize the data payload into bytes using the specified format
     ///
     /// # Type Parameters
@@ -86,10 +135,7 @@ impl<D: Data> LogValueDeserialized<D> {
     /// ```ignore
     /// let serialized = deserialized.into_serialized(serde_json::to_vec)?;
     /// ```
-    pub fn into_serialized<E, F>(
-        self,
-        serialize_fn: F,
-    ) -> Result<LogValueSerialized>
+    pub fn into_serialized<E, F>(self, serialize_fn: F) -> Result<LogValueSerialized>
     where
         E: std::error::Error + Send + Sync + 'static,
         F: FnOnce(&D) -> std::result::Result<Vec<u8>, E>,

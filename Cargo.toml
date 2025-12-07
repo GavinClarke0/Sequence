@@ -14,10 +14,16 @@ serde_json = "1.0"
 thiserror = "2.0"
 tokio = { version = "1.47.1", features = ["full"] }
 memmap2 = "0.9"
+fjall = "2.11.2"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["async_tokio"] }
+tempfile = "3.14"
 
 [[bench]]
 name = "concurrent_rw"
+harness = false
+
+[[bench]]
+name = "fjall_log"
 harness = false

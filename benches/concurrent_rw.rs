@@ -1,7 +1,7 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId};
-use sequence::log_segment::{ActiveMemoryLogSegment, LogSegmentWriter, LogSegmentReader};
+use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use sequence::log_segment::{ActiveMemoryLogSegment, LogSegmentReader, LogSegmentWriter};
 use sequence::log_value::LogValueDeserialized;
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
@@ -58,14 +58,14 @@ fn concurrent_rw_benchmark(c: &mut Criterion) {
 
                             while read_count < target_reads {
                                 // Try to read at current position
-                                if let Ok(entry) = LogSegmentReader::get(&*read_segment, read_count).await {
+                                if let Ok(entry) =
+                                    LogSegmentReader::get(&*read_segment, read_count).await
+                                {
                                     black_box(entry);
                                     read_count += 1;
                                 } else {
                                     // Entry not yet available, yield and retry
                                     tokio::task::yield_now().await;
-
-                                    
                                 }
                             }
                         });
@@ -124,7 +124,9 @@ fn write_heavy_benchmark(c: &mut Criterion) {
                             let mut read_count = 0;
 
                             while read_count < total_writes / 2 {
-                                if let Ok(entry) = LogSegmentReader::get(&*read_segment, read_count).await {
+                                if let Ok(entry) =
+                                    LogSegmentReader::get(&*read_segment, read_count).await
+                                {
                                     black_box(entry);
                                     read_count += 1;
                                 } else {
@@ -190,7 +192,9 @@ fn read_heavy_benchmark(c: &mut Criterion) {
 
                                 for i in start_index..end_index {
                                     loop {
-                                        if let Ok(entry) = LogSegmentReader::get(&*read_segment, i).await {
+                                        if let Ok(entry) =
+                                            LogSegmentReader::get(&*read_segment, i).await
+                                        {
                                             black_box(entry);
                                             break;
                                         } else {
