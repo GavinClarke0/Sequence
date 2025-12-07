@@ -26,6 +26,8 @@ pub trait LogSegmentReader<D: Data>: Send + Sync {
     fn min_index(&self) -> u32;
     /// Maximum index in the log segment.
     fn max_index(&self) -> u32;
+    /// Check if segment is empty
+    fn is_empty(&self) -> bool;
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -190,6 +192,10 @@ impl<D: Data + Clone> LogSegmentReader<D> for ActiveMemoryLogSegment<D> {
     fn max_index(&self) -> u32 {
         let inner = self.inner.read();
         self.log_index_to_segment_index(inner.write_index - 1)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.inner.read().entries.is_empty()
     }
 }
 
