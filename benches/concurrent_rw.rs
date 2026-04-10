@@ -1,76 +1,75 @@
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
-use sequence::log_segment::{ActiveMemoryLogSegment, LogSegmentReader, LogSegmentWriter};
-use sequence::log_value::LogValueDeserialized;
-use serde::{Deserialize, Serialize};
+use sequence::{FjallDatabase, FjallQueue, Queueable};
 use std::sync::Arc;
+use tempfile::TempDir;
 
-#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
+#[derive(Debug, Clone)]
 struct BenchmarkData {
     value: i64,
     name: String,
-    timestamp: u64,
 }
 
-/// Benchmark concurrent writes and reads on a shared log segment
-/// - Writer task continuously appends entries
-/// - Reader task continuously reads entries
+impl Queueable for BenchmarkData {
+    fn serialize(&self) -> Vec<u8> {
+        let mut bytes = self.value.to_le_bytes().to_vec();
+        bytes.extend_from_slice(self.name.as_bytes());
+        bytes
+    }
+
+    fn deserialize(bytes: &[u8]) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let value = i64::from_le_bytes(bytes[..8].try_into()?);
+        let name = String::from_utf8(bytes[8..].to_vec())?;
+        Ok(BenchmarkData { value, name })
+    }
+}
+
+fn open_queue(dir: &TempDir) -> Arc<FjallQueue<BenchmarkData>> {
+    let db = FjallDatabase::new(dir.path().to_path_buf()).unwrap();
+    Arc::new(db.open_queue("bench").unwrap())
+}
+
 fn concurrent_rw_benchmark(c: &mut Criterion) {
     let mut group = c.benchmark_group("concurrent_rw");
 
-    // Test with different write/read ratios
-    for write_count in [100, 1000, 5000].iter() {
+    for write_count in [100u64, 1000, 5000].iter() {
         group.bench_with_input(
             BenchmarkId::from_parameter(format!("{}_writes", write_count)),
             write_count,
             |b, &write_count| {
                 b.to_async(tokio::runtime::Runtime::new().unwrap())
                     .iter(|| async {
-                        // Create a shared log segment wrapped in Arc
-                        let segment = Arc::new(ActiveMemoryLogSegment::<BenchmarkData>::new(0));
+                        let dir = TempDir::new().unwrap();
+                        let queue = open_queue(&dir);
 
-                        let write_segment = Arc::clone(&segment);
-                        let read_segment = Arc::clone(&segment);
+                        let write_queue = Arc::clone(&queue);
+                        let read_queue = Arc::clone(&queue);
 
-                        // Writer task
                         let writer = tokio::spawn(async move {
                             for i in 0..write_count {
-                                let entry = LogValueDeserialized {
-                                    key: i as u128,
-                                    data: BenchmarkData {
+                                write_queue
+                                    .append(&BenchmarkData {
                                         value: i as i64,
                                         name: format!("entry_{}", i),
-                                        timestamp: i as u64,
-                                    },
-                                    metadata: vec![],
-                                };
-                                let res = write_segment.append(entry).await;
-
-                                if res.is_err() {
-                                    panic!("bad stuff")
-                                }
+                                    })
+                                    .unwrap();
                             }
                         });
 
-                        // Reader task - reads entries as they become available
+                        let target = write_count / 2;
                         let reader = tokio::spawn(async move {
-                            let mut read_count = 0;
-                            let target_reads = write_count / 2; // Read half of what's written
-
-                            while read_count < target_reads {
-                                // Try to read at current position
-                                if let Ok(entry) =
-                                    LogSegmentReader::get(&*read_segment, read_count).await
-                                {
-                                    black_box(entry);
-                                    read_count += 1;
-                                } else {
-                                    // Entry not yet available, yield and retry
+                            let mut fetched = 0u64;
+                            while fetched < target {
+                                let batch = read_queue.fetch_batch(fetched, 100).unwrap();
+                                for msg in batch {
+                                    black_box(&msg.data);
+                                    fetched = msg.seq + 1;
+                                }
+                                if fetched < target {
                                     tokio::task::yield_now().await;
                                 }
                             }
                         });
 
-                        // Wait for both tasks to complete
                         let _ = tokio::join!(writer, reader);
                     });
             },
@@ -80,136 +79,36 @@ fn concurrent_rw_benchmark(c: &mut Criterion) {
     group.finish();
 }
 
-/// Benchmark write-heavy workload (multiple writers, single reader)
 fn write_heavy_benchmark(c: &mut Criterion) {
     let mut group = c.benchmark_group("write_heavy");
 
-    for num_writers in [2, 4, 8].iter() {
+    for num_writers in [2usize, 4, 8].iter() {
         group.bench_with_input(
             BenchmarkId::from_parameter(format!("{}_writers", num_writers)),
             num_writers,
             |b, &num_writers| {
                 b.to_async(tokio::runtime::Runtime::new().unwrap())
                     .iter(|| async {
-                        let segment = Arc::new(ActiveMemoryLogSegment::<BenchmarkData>::new(0));
+                        let dir = TempDir::new().unwrap();
+                        let queue = open_queue(&dir);
+                        let writes_per_writer = 100u64;
 
-                        let writes_per_writer = 100;
-
-                        // Spawn multiple writer tasks
-                        let mut writer_handles = vec![];
+                        let mut handles = vec![];
                         for writer_id in 0..num_writers {
-                            let write_segment = Arc::clone(&segment);
-                            let handle = tokio::spawn(async move {
+                            let q = Arc::clone(&queue);
+                            handles.push(tokio::spawn(async move {
                                 for i in 0..writes_per_writer {
-                                    let entry = LogValueDeserialized {
-                                        key: (writer_id * writes_per_writer + i) as u128,
-                                        data: BenchmarkData {
-                                            value: i as i64,
-                                            name: format!("writer_{}_entry_{}", writer_id, i),
-                                            timestamp: i as u64,
-                                        },
-                                        metadata: vec![],
-                                    };
-
-                                    let _ = write_segment.append(entry).await;
-                                }
-                            });
-                            writer_handles.push(handle);
-                        }
-
-                        // Single reader task
-                        let read_segment = Arc::clone(&segment);
-                        let reader = tokio::spawn(async move {
-                            let total_writes = num_writers * writes_per_writer;
-                            let mut read_count = 0;
-
-                            while read_count < total_writes / 2 {
-                                if let Ok(entry) =
-                                    LogSegmentReader::get(&*read_segment, read_count).await
-                                {
-                                    black_box(entry);
-                                    read_count += 1;
-                                } else {
-                                    tokio::task::yield_now().await;
-                                }
-                            }
-                        });
-
-                        // Wait for all tasks
-                        for handle in writer_handles {
-                            let _ = handle.await;
-                        }
-                        let _ = reader.await;
-                    });
-            },
-        );
-    }
-
-    group.finish();
-}
-
-/// Benchmark read-heavy workload (single writer, multiple readers)
-fn read_heavy_benchmark(c: &mut Criterion) {
-    let mut group = c.benchmark_group("read_heavy");
-
-    for num_readers in [2, 4, 8].iter() {
-        group.bench_with_input(
-            BenchmarkId::from_parameter(format!("{}_readers", num_readers)),
-            num_readers,
-            |b, &num_readers| {
-                b.to_async(tokio::runtime::Runtime::new().unwrap())
-                    .iter(|| async {
-                        let segment = Arc::new(ActiveMemoryLogSegment::<BenchmarkData>::new(0));
-
-                        let write_count = 500;
-
-                        // Single writer task
-                        let write_segment = Arc::clone(&segment);
-                        let writer = tokio::spawn(async move {
-                            for i in 0..write_count {
-                                let entry = LogValueDeserialized {
-                                    key: i as u128,
-                                    data: BenchmarkData {
+                                    q.append(&BenchmarkData {
                                         value: i as i64,
-                                        name: format!("entry_{}", i),
-                                        timestamp: i as u64,
-                                    },
-                                    metadata: vec![],
-                                };
-
-                                let _ = write_segment.append(entry).await;
-                            }
-                        });
-
-                        // Multiple reader tasks
-                        let mut reader_handles = vec![];
-                        for reader_id in 0..num_readers {
-                            let read_segment = Arc::clone(&segment);
-                            let handle = tokio::spawn(async move {
-                                let reads_per_reader = write_count / num_readers;
-                                let start_index = reader_id * reads_per_reader;
-                                let end_index = start_index + reads_per_reader;
-
-                                for i in start_index..end_index {
-                                    loop {
-                                        if let Ok(entry) =
-                                            LogSegmentReader::get(&*read_segment, i).await
-                                        {
-                                            black_box(entry);
-                                            break;
-                                        } else {
-                                            tokio::task::yield_now().await;
-                                        }
-                                    }
+                                        name: format!("w{}_e{}", writer_id, i),
+                                    })
+                                    .unwrap();
                                 }
-                            });
-                            reader_handles.push(handle);
+                            }));
                         }
 
-                        // Wait for all tasks
-                        let _ = writer.await;
-                        for handle in reader_handles {
-                            let _ = handle.await;
+                        for h in handles {
+                            let _ = h.await;
                         }
                     });
             },
@@ -219,10 +118,5 @@ fn read_heavy_benchmark(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(
-    benches,
-    concurrent_rw_benchmark,
-    write_heavy_benchmark,
-    read_heavy_benchmark
-);
+criterion_group!(benches, concurrent_rw_benchmark, write_heavy_benchmark);
 criterion_main!(benches);

@@ -1,3 +1,6 @@
+//! currently unused code which will be used once a log which
+//! utilizes log segments is created. 
+
 use crate::log_value::{Data, LogValueDeserialized};
 use async_trait::async_trait;
 use parking_lot::RwLock;
